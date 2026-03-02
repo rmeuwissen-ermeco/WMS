@@ -1,13 +1,15 @@
-import { Controller, Get } from "@nestjs/common";
-import { PrismaService } from "./prisma/prisma.service";
+import { Controller, Get, Header } from "@nestjs/common";
 
 @Controller()
 export class HealthController {
-  constructor(private prisma: PrismaService) {}
-
   @Get("/health")
-  async health() {
-    const count = await this.prisma.user.count();
-    return { ok: true, users: count };
+  @Header("Cache-Control", "no-store")
+  health() {
+    // Render/GitHub Actions kunnen dit als env zetten; lokaal is het leeg en dat is ok.
+    return {
+      ok: true,
+      git_sha: process.env.GIT_SHA ?? null,
+      render_service: process.env.RENDER_SERVICE_NAME ?? null,
+    };
   }
 }
