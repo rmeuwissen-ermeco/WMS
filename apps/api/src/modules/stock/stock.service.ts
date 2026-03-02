@@ -2,18 +2,15 @@ import { ConflictException, Injectable, NotFoundException } from "@nestjs/common
 import { Prisma, StockTxType } from "@prisma/client";
 import { PrismaService } from "../../prisma/prisma.service";
 
-type ReceiveDto = {
+type BaseDto = {
   request_id: string;
   sku: string;
   qty: number;
   meta?: Prisma.InputJsonValue;
 };
 
-type AdjustDto = {
-  request_id: string;
-  sku: string;
-  qty: number; // non-zero (controller en zod doen de check)
-  meta?: Prisma.InputJsonValue;
+type ReceiveDto = BaseDto & {
+  serials?: string[];
 };
 
 @Injectable()
@@ -24,24 +21,34 @@ export class StockService {
     return onHand - reserved;
   }
 
-  private safeJson(meta: Prisma.InputJsonValue | undefined): Prisma.InputJsonValue | null {
-    return meta === undefined ? null : meta;
-  }
-
   async receive(dto: ReceiveDto) {
-    const { request_id, sku, qty, meta } = dto;
+    const { request_id, sku, qty, meta, serials } = dto;
 
     return this.prisma.$transaction(async (tx) => {
       // 1) idempotency
       const existing = await tx.stockTransaction.findUnique({ where: { requestId: request_id } });
-      if (existing) {
-        // we stored response in meta; return that
-        return (existing.meta as any) ?? { reused: true, tx_id: existing.id };
-      }
+      if (existing) return existing.meta ?? { reused: true, tx_id: existing.id };
 
       // 2) product
       const product = await tx.product.findUnique({ where: { sku } });
       if (!product) throw new NotFoundException("Unknown SKU");
+
+      // 2b) serial rules
+      if (serials && serials.length > 0) {
+        if (!product.trackSerial) throw new ConflictException("Product does not track serials");
+        if (serials.length !== qty) {
+          throw new ConflictException({
+            message: "qty must match serials.length",
+            qty,
+            serials: serials.length,
+          });
+        }
+        // simpele dedupe check
+        const uniq = new Set(serials);
+        if (uniq.size !== serials.length) {
+          throw new ConflictException("Duplicate serials in request");
+        }
+      }
 
       // 3) ensure balance exists
       await tx.stockBalance.upsert({
@@ -65,7 +72,20 @@ export class StockService {
       const afterOnHand = before.onHand + qty;
       const afterReserved = before.reserved;
 
-      // 5) update cache (same tx)
+      // 5) serial inserts (same tx, before commit)
+      if (serials && serials.length > 0) {
+        // status enums: pas aan als jouw enum anders heet
+        await tx.serialNumber.createMany({
+          data: serials.map((s) => ({
+            productId: product.id,
+            serial: s,
+            status: "ON_HAND" as any,
+          })),
+          // skipDuplicates: false => unique violation => error (goed)
+        });
+      }
+
+      // 6) update cache (same tx)
       await tx.stockBalance.update({
         where: { productId: product.id },
         data: { onHand: afterOnHand, reserved: afterReserved },
@@ -87,9 +107,9 @@ export class StockService {
         },
       };
 
-      const safeMeta = this.safeJson(meta);
+      const safeMeta: Prisma.InputJsonValue | null =
+        meta === undefined ? null : (meta as Prisma.InputJsonValue);
 
-      // 6) ledger insert
       await tx.stockTransaction.create({
         data: {
           requestId: request_id,
@@ -99,7 +119,7 @@ export class StockService {
           deltaOnHand: qty,
           deltaReserved: 0,
           meta: {
-            request: { request_id, sku, qty, meta: safeMeta },
+            request: { request_id, sku, qty, meta: safeMeta, serials: serials ?? null },
             response,
           } as Prisma.InputJsonValue,
         },
@@ -109,26 +129,23 @@ export class StockService {
     });
   }
 
-  async reserve(dto: ReceiveDto) {
+  // --- Jouw bestaande methods blijven zoals ze al werken ---
+  async reserve(dto: BaseDto) {
     const { request_id, sku, qty, meta } = dto;
 
     return this.prisma.$transaction(async (tx) => {
-      // 1) idempotency
       const existing = await tx.stockTransaction.findUnique({ where: { requestId: request_id } });
-      if (existing) return (existing.meta as any) ?? { reused: true, tx_id: existing.id };
+      if (existing) return existing.meta ?? { reused: true, tx_id: existing.id };
 
-      // 2) product
       const product = await tx.product.findUnique({ where: { sku } });
       if (!product) throw new NotFoundException("Unknown SKU");
 
-      // 3) ensure balance exists
       await tx.stockBalance.upsert({
         where: { productId: product.id },
         update: {},
         create: { productId: product.id, onHand: 0, reserved: 0 },
       });
 
-      // 4) lock balance row
       const rows = await tx.$queryRaw<Array<{ productId: string; onHand: number; reserved: number }>>(
         Prisma.sql`
           SELECT "productId", "onHand", "reserved"
@@ -142,31 +159,25 @@ export class StockService {
       const before = rows[0];
       const available = this.computeAvailable(before.onHand, before.reserved);
       if (available < qty) {
-        throw new ConflictException({
-          message: "Insufficient available stock",
-          available,
-          requested: qty,
-        });
+        throw new ConflictException({ message: "Insufficient available stock", available, requested: qty });
       }
 
       const afterOnHand = before.onHand;
       const afterReserved = before.reserved + qty;
 
-      // 5) update cache
       await tx.stockBalance.update({
         where: { productId: product.id },
         data: { onHand: afterOnHand, reserved: afterReserved },
       });
 
+      const safeMeta: Prisma.InputJsonValue | null =
+        meta === undefined ? null : (meta as Prisma.InputJsonValue);
+
       const response = {
         tx_type: "RESERVE",
         sku,
         qty,
-        before: {
-          on_hand: before.onHand,
-          reserved: before.reserved,
-          available,
-        },
+        before: { on_hand: before.onHand, reserved: before.reserved, available },
         after: {
           on_hand: afterOnHand,
           reserved: afterReserved,
@@ -174,9 +185,6 @@ export class StockService {
         },
       };
 
-      const safeMeta = this.safeJson(meta);
-
-      // 6) ledger insert
       await tx.stockTransaction.create({
         data: {
           requestId: request_id,
@@ -185,10 +193,7 @@ export class StockService {
           qty,
           deltaOnHand: 0,
           deltaReserved: qty,
-          meta: {
-            request: { request_id, sku, qty, meta: safeMeta },
-            response,
-          } as Prisma.InputJsonValue,
+          meta: { request: { request_id, sku, qty, meta: safeMeta }, response } as Prisma.InputJsonValue,
         },
       });
 
@@ -196,26 +201,22 @@ export class StockService {
     });
   }
 
-  async ship(dto: ReceiveDto) {
+  async ship(dto: BaseDto) {
     const { request_id, sku, qty, meta } = dto;
 
     return this.prisma.$transaction(async (tx) => {
-      // 1) idempotency
       const existing = await tx.stockTransaction.findUnique({ where: { requestId: request_id } });
-      if (existing) return (existing.meta as any) ?? { reused: true, tx_id: existing.id };
+      if (existing) return existing.meta ?? { reused: true, tx_id: existing.id };
 
-      // 2) product
       const product = await tx.product.findUnique({ where: { sku } });
       if (!product) throw new NotFoundException("Unknown SKU");
 
-      // 3) ensure balance exists
       await tx.stockBalance.upsert({
         where: { productId: product.id },
         update: {},
         create: { productId: product.id, onHand: 0, reserved: 0 },
       });
 
-      // 4) lock balance row
       const rows = await tx.$queryRaw<Array<{ productId: string; onHand: number; reserved: number }>>(
         Prisma.sql`
           SELECT "productId", "onHand", "reserved"
@@ -227,8 +228,6 @@ export class StockService {
       if (rows.length !== 1) throw new ConflictException("Balance lock failed");
 
       const before = rows[0];
-
-      // SHIP requires reserved >= qty
       if (before.reserved < qty) {
         throw new ConflictException({
           message: "Insufficient reserved stock to ship",
@@ -240,11 +239,13 @@ export class StockService {
       const afterOnHand = before.onHand - qty;
       const afterReserved = before.reserved - qty;
 
-      // 5) update cache
       await tx.stockBalance.update({
         where: { productId: product.id },
         data: { onHand: afterOnHand, reserved: afterReserved },
       });
+
+      const safeMeta: Prisma.InputJsonValue | null =
+        meta === undefined ? null : (meta as Prisma.InputJsonValue);
 
       const response = {
         tx_type: "SHIP",
@@ -262,9 +263,6 @@ export class StockService {
         },
       };
 
-      const safeMeta = this.safeJson(meta);
-
-      // 6) ledger insert
       await tx.stockTransaction.create({
         data: {
           requestId: request_id,
@@ -273,10 +271,7 @@ export class StockService {
           qty,
           deltaOnHand: -qty,
           deltaReserved: -qty,
-          meta: {
-            request: { request_id, sku, qty, meta: safeMeta },
-            response,
-          } as Prisma.InputJsonValue,
+          meta: { request: { request_id, sku, qty, meta: safeMeta }, response } as Prisma.InputJsonValue,
         },
       });
 
@@ -284,26 +279,22 @@ export class StockService {
     });
   }
 
-  async adjust(dto: AdjustDto) {
+  async adjust(dto: BaseDto) {
     const { request_id, sku, qty, meta } = dto;
 
     return this.prisma.$transaction(async (tx) => {
-      // 1) idempotency
       const existing = await tx.stockTransaction.findUnique({ where: { requestId: request_id } });
-      if (existing) return (existing.meta as any) ?? { reused: true, tx_id: existing.id };
+      if (existing) return existing.meta ?? { reused: true, tx_id: existing.id };
 
-      // 2) product
       const product = await tx.product.findUnique({ where: { sku } });
       if (!product) throw new NotFoundException("Unknown SKU");
 
-      // 3) ensure balance exists
       await tx.stockBalance.upsert({
         where: { productId: product.id },
         update: {},
         create: { productId: product.id, onHand: 0, reserved: 0 },
       });
 
-      // 4) lock balance row
       const rows = await tx.$queryRaw<Array<{ productId: string; onHand: number; reserved: number }>>(
         Prisma.sql`
           SELECT "productId", "onHand", "reserved"
@@ -315,22 +306,22 @@ export class StockService {
       if (rows.length !== 1) throw new ConflictException("Balance lock failed");
 
       const before = rows[0];
-
-      // Adjust must not make onHand < reserved
-      const afterOnHand = before.onHand + qty;
-      if (afterOnHand < before.reserved) {
+      const newOnHand = before.onHand + qty;
+      if (newOnHand < before.reserved) {
         throw new ConflictException({
           message: "Adjust would make on_hand < reserved",
-          on_hand_after: afterOnHand,
+          on_hand_after: newOnHand,
           reserved: before.reserved,
         });
       }
 
-      // 5) update cache
       await tx.stockBalance.update({
         where: { productId: product.id },
-        data: { onHand: afterOnHand },
+        data: { onHand: newOnHand },
       });
+
+      const safeMeta: Prisma.InputJsonValue | null =
+        meta === undefined ? null : (meta as Prisma.InputJsonValue);
 
       const response = {
         tx_type: "ADJUST",
@@ -342,15 +333,12 @@ export class StockService {
           available: this.computeAvailable(before.onHand, before.reserved),
         },
         after: {
-          on_hand: afterOnHand,
+          on_hand: newOnHand,
           reserved: before.reserved,
-          available: this.computeAvailable(afterOnHand, before.reserved),
+          available: this.computeAvailable(newOnHand, before.reserved),
         },
       };
 
-      const safeMeta = this.safeJson(meta);
-
-      // 6) ledger insert
       await tx.stockTransaction.create({
         data: {
           requestId: request_id,
@@ -359,10 +347,7 @@ export class StockService {
           qty,
           deltaOnHand: qty,
           deltaReserved: 0,
-          meta: {
-            request: { request_id, sku, qty, meta: safeMeta },
-            response,
-          } as Prisma.InputJsonValue,
+          meta: { request: { request_id, sku, qty, meta: safeMeta }, response } as Prisma.InputJsonValue,
         },
       });
 

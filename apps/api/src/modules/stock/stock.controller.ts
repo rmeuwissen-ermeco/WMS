@@ -1,51 +1,41 @@
 import { Body, Controller, Post, UseGuards } from "@nestjs/common";
-import { AuthGuard } from "@nestjs/passport";
+import { ZodValidationPipe, z } from "../../common/zod";
+import { JwtAuthGuard } from "../auth/jwt-auth.guard";
 import { StockService } from "./stock.service";
-import { parseOrThrow, z } from "../../common/zod";
 
-const Base = {
+const ReceiveSchema = z.object({
   request_id: z.string().uuid(),
   sku: z.string().min(1),
   qty: z.number().int().positive(),
   meta: z.any().optional(),
-};
-
-const ReceiveSchema = z.object(Base);
-
-const ReserveSchema = z.object(Base);
-
-const ShipSchema = z.object(Base);
-
-const AdjustSchema = z.object({
-  request_id: z.string().uuid(),
-  sku: z.string().min(1),
-  // qty kan positief of negatief zijn bij adjust
-  qty: z.number().int().refine((n) => n !== 0, "qty must be non-zero"),
-  meta: z.any().optional(),
+  serials: z.array(z.string().min(1)).optional(),
 });
 
 @Controller()
-@UseGuards(AuthGuard("jwt"))
 export class StockController {
   constructor(private readonly stock: StockService) {}
 
-  @Post("mutations/receive")
-  async receive(@Body() body: unknown) {
-    return this.stock.receive(parseOrThrow(ReceiveSchema, body));
+  @UseGuards(JwtAuthGuard)
+  @Post("/mutations/receive")
+  async receive(@Body(new ZodValidationPipe(ReceiveSchema)) body: z.infer<typeof ReceiveSchema>) {
+    return this.stock.receive(body);
   }
 
-  @Post("mutations/reserve")
-  async reserve(@Body() body: unknown) {
-    return this.stock.reserve(parseOrThrow(ReserveSchema, body));
+  @UseGuards(JwtAuthGuard)
+  @Post("/mutations/reserve")
+  async reserve(@Body(new ZodValidationPipe(ReceiveSchema)) body: z.infer<typeof ReceiveSchema>) {
+    return this.stock.reserve(body);
   }
 
-  @Post("mutations/ship")
-  async ship(@Body() body: unknown) {
-    return this.stock.ship(parseOrThrow(ShipSchema, body));
+  @UseGuards(JwtAuthGuard)
+  @Post("/mutations/ship")
+  async ship(@Body(new ZodValidationPipe(ReceiveSchema)) body: z.infer<typeof ReceiveSchema>) {
+    return this.stock.ship(body);
   }
 
-  @Post("mutations/adjust")
-  async adjust(@Body() body: unknown) {
-    return this.stock.adjust(parseOrThrow(AdjustSchema, body));
+  @UseGuards(JwtAuthGuard)
+  @Post("/mutations/adjust")
+  async adjust(@Body(new ZodValidationPipe(ReceiveSchema)) body: z.infer<typeof ReceiveSchema>) {
+    return this.stock.adjust(body);
   }
 }
