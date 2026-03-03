@@ -1,14 +1,18 @@
-import { Controller, Get } from "@nestjs/common";
+import { Controller, Get, Req } from "@nestjs/common";
+import type { Request } from "express";
 
 @Controller()
 export class RoutesDebugController {
   @Get("/__routes")
-  routes() {
-    // Express router stack
-    const express = (global as any).__express_app;
-    if (!express?._router?.stack) return { ok: false, reason: "no express router stack" };
+  routes(@Req() req: Request) {
+    const app: any = (req as any).app;
+    const stack = app?._router?.stack;
 
-    const routes = express._router.stack
+    if (!Array.isArray(stack)) {
+      return { ok: false, reason: "no express router stack on req.app" };
+    }
+
+    const routes = stack
       .filter((l: any) => l.route)
       .map((l: any) => ({
         path: l.route.path,
