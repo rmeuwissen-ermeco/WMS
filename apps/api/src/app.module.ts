@@ -7,6 +7,7 @@ import { StockModule } from "./modules/stock/stock.module";
 import { InventoryModule } from "./modules/inventory/inventory.module";
 import { ProductsModule } from "./modules/products/products.module";
 import { RoutesDebugController } from "./routes-debug.controller";
+import { DiscoveryModule } from "@nestjs/core";
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { RoutesDebugController } from "./routes-debug.controller";
     StockModule,
     InventoryModule,
     ProductsModule,
+    DiscoveryModule,
   ],
   controllers: [HealthController, RoutesDebugController],
 })
